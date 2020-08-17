@@ -10,6 +10,8 @@ using BattleTech;
 using BattleTech.Framework;
 
 using MissionControl.Logic;
+using MissionControl.Trigger;
+using MissionControl.Config;
 
 namespace MissionControl.Rules {
   public abstract class EncounterRules {
@@ -43,9 +45,10 @@ namespace MissionControl.Rules {
     }
 
     public void ActivatePostFeatures() {
-      if (Main.Settings.AdditionalPlayerMechs && MissionControl.Instance.IsDroppingCustomControlledPlayerLance()) new AddCustomPlayerMechsBatch(this);
+      if (MissionControl.Instance.AreAdditionalPlayerMechsAllowed() && MissionControl.Instance.IsDroppingCustomControlledPlayerLance()) new AddCustomPlayerMechsBatch(this);
       if (MissionControl.Instance.IsExtendedLancesAllowed()) new AddExtraLanceSpawnsForExtendedLancesBatch(this);
-      if (Main.Settings.DynamicWithdraw.Enable && !MissionControl.Instance.IsSkirmish()) new AddDynamicWithdrawBatch(this);
+      if (MissionControl.Instance.IsDynamicWithdrawAllowed()) new AddDynamicWithdrawBatch(this);
+      BuildAi();
     }
 
     public abstract void Build();
@@ -124,8 +127,8 @@ namespace MissionControl.Rules {
       return guids;
     }
 
-    private bool IsPlotValidForEncounter(Transform plotTransform) {
-      Transform selectedPlotTransform = plotTransform.FindIgnoreCaseStartsWith("PlotVariant");
+    private bool IsPlotValidForEncounter(Transform plotTransform, string name = "PlotVariant") {
+      Transform selectedPlotTransform = plotTransform.FindIgnoreCaseStartsWith(name);
 
       if (selectedPlotTransform == null) {
         return false;
@@ -137,15 +140,14 @@ namespace MissionControl.Rules {
       return false;
     }
 
-    protected GameObject GetClosestPlot(Vector3 origin) {
-      GameObject plotsParentGo = GameObject.Find("PlotParent");
+    private GameObject CheckAllPlotsForValidPlot(GameObject plotsParent, Vector3 origin, string name) {
       GameObject closestPlot = null;
       float closestDistance = -1;
 
-      foreach (Transform t in plotsParentGo.transform) {
+      foreach (Transform t in plotsParent.transform) {
         Vector3 plotPosition = t.position;
         if (EncounterLayerData.IsInEncounterBounds(plotPosition)) {
-          if (IsPlotValidForEncounter(t)) {
+          if (IsPlotValidForEncounter(t, name)) {
             float distance = Vector3.Distance(t.position, origin);
             if (closestDistance == -1 || closestDistance < distance) {
               closestDistance = distance;
@@ -153,6 +155,24 @@ namespace MissionControl.Rules {
             }
           }
         }
+      }
+
+      return closestPlot;
+    }
+
+    protected GameObject GetClosestPlot(Vector3 origin) {
+      GameObject plotsParentGo = GameObject.Find("PlotParent");
+      GameObject closestPlot = null;
+
+      closestPlot = CheckAllPlotsForValidPlot(plotsParentGo, origin, "plotVariant_");
+
+      if (closestPlot == null) {
+        closestPlot = CheckAllPlotsForValidPlot(plotsParentGo, origin, "PlotVariant");
+      }
+
+      // If no plot is found, select on a secondary fallback
+      if (closestPlot == null) {
+        closestPlot = CheckAllPlotsForValidPlot(plotsParentGo, origin, "Default");
       }
 
       return closestPlot;
@@ -177,7 +197,7 @@ namespace MissionControl.Rules {
 
       if (type == "ArenaSkirmish") {
         return "MultiPlayerSkirmishChunk";
-      } else if (type == "Story_1B_Retreat") {
+      } else if ((type == "Story_1B_Retreat") || (type == "Story_2_ThreeYearsLater_Default")) {
         return "Gen_PlayerLance";
       }
 
@@ -199,25 +219,52 @@ namespace MissionControl.Rules {
     }
 
     protected void BuildAdditionalLances(string enemyOrientationTargetKey, SpawnLogic.LookDirection enemyLookDirection,
-      string allyOrientationKey, SpawnLogic.LookDirection allyLookDirection, float minAllyDistance, float maxAllyDistance) {
+      string allyOrientationKey, SpawnLogic.LookDirection allyLookDirection, float mustBeBeyondDistance, float mustBeWithinDistance) {
+
+      BuildAdditionalLances(enemyOrientationTargetKey, enemyLookDirection, 100f, 400f, allyOrientationKey, allyLookDirection, mustBeBeyondDistance, mustBeWithinDistance);
+    }
+
+    protected void BuildAdditionalLances(string enemyOrientationTargetKey, SpawnLogic.LookDirection enemyLookDirection, float mustBeBeyondDistanceOfTarget, float mustBeWithinDistanceOfTarget,
+      string allyOrientationKey, SpawnLogic.LookDirection allyLookDirection, float mustBeBeyondDistance, float mustBeWithinDistance) {
 
       Main.Logger.Log($"[{this.GetType().Name}] Building additional lance rules");
 
-      if (MissionControl.Instance.AreAdditionalLancesAllowed("enemy")) {
+      int numberOfAdditionalEnemyLances = 0;
 
-        bool isPrimaryObjective = MissionControl.Instance.CurrentContractType.In("SimpleBattle");
+      if (MissionControl.Instance.AreAdditionalLancesAllowed("enemy")) {
+        bool isPrimaryObjective = MissionControl.Instance.CurrentContractType.In(Main.Settings.AdditionalLanceSettings.IsPrimaryObjectiveIn.ToArray());
+        bool displayToUser = !Main.Settings.AdditionalLanceSettings.HideObjective;
+        bool excludeFromAutocomplete = MissionControl.Instance.CurrentContractType.In(Main.Settings.AdditionalLanceSettings.ExcludeFromAutocomplete.ToArray());
+
+        Main.Logger.Log($"[{this.GetType().Name}] Excluding Additional Lance from contract type's autocomplete? {excludeFromAutocomplete}");
+
+        if (Main.Settings.AdditionalLanceSettings.AlwaysDisplayHiddenObjectiveIfPrimary) {
+          displayToUser = (isPrimaryObjective) ? true : displayToUser;
+        }
+
+        Main.Logger.Log($"[{this.GetType().Name}] Additional Lances will be primary objectives? {isPrimaryObjective}");
         FactionDef faction = MissionControl.Instance.GetFactionFromTeamType("enemy");
 
-        int numberOfAdditionalEnemyLances = Main.Settings.ActiveAdditionalLances.Enemy.SelectNumberOfAdditionalLances(faction, "enemy");
+        numberOfAdditionalEnemyLances = Main.Settings.ActiveAdditionalLances.Enemy.SelectNumberOfAdditionalLances(faction, "enemy");
+        if (Main.Settings.DebugMode && (Main.Settings.Debug.AdditionalLancesEnemyLanceCount > -1)) numberOfAdditionalEnemyLances = Main.Settings.Debug.AdditionalLancesEnemyLanceCount;
+
+        // Allow contract-specific settings overrides to force their respective setting
+        if (Main.Settings.ActiveContractSettings.Has(ContractSettingsOverrides.AdditionalLances_EnemyLanceCountOverride)) {
+          numberOfAdditionalEnemyLances = Main.Settings.ActiveContractSettings.GetInt(ContractSettingsOverrides.AdditionalLances_EnemyLanceCountOverride);
+          Main.Logger.Log($"[{this.GetType().Name}] Using contract-specific settings override for contract '{MissionControl.Instance.CurrentContract.Name}'. Enemy lance count will be '{numberOfAdditionalEnemyLances}'.");
+        }
+
+        bool showObjectiveOnLanceDetected = Main.Settings.AdditionalLanceSettings.ShowObjectiveOnLanceDetected;
+
         int objectivePriority = -10;
 
         for (int i = 0; i < numberOfAdditionalEnemyLances; i++) {
           if (MissionControl.Instance.CurrentContractType == "ArenaSkirmish") {
-            new AddPlayer2LanceWithDestroyObjectiveBatch(this, enemyOrientationTargetKey, enemyLookDirection, 50f, 200f,
-              $"Destroy Enemy Support Lance {i + 1}", objectivePriority--, isPrimaryObjective);
+            new AddPlayer2LanceWithDestroyObjectiveBatch(this, enemyOrientationTargetKey, enemyLookDirection, mustBeBeyondDistanceOfTarget, mustBeWithinDistanceOfTarget,
+              $"Destroy Enemy Support Lance {i + 1}", objectivePriority--, isPrimaryObjective, displayToUser, showObjectiveOnLanceDetected, excludeFromAutocomplete);
           } else {
-            new AddTargetLanceWithDestroyObjectiveBatch(this, enemyOrientationTargetKey, enemyLookDirection, 50f, 200f,
-              $"Destroy {{TEAM_TAR.FactionDef.Demonym}} Support Lance {i + 1}", objectivePriority--, isPrimaryObjective);
+            new AddTargetLanceWithDestroyObjectiveBatch(this, enemyOrientationTargetKey, enemyLookDirection, mustBeBeyondDistanceOfTarget, mustBeWithinDistanceOfTarget,
+              $"Destroy {{TEAM_TAR.FactionDef.Demonym}} Support Lance {i + 1}", objectivePriority--, isPrimaryObjective, displayToUser, showObjectiveOnLanceDetected, excludeFromAutocomplete);
           }
         }
       }
@@ -226,8 +273,18 @@ namespace MissionControl.Rules {
         FactionDef faction = MissionControl.Instance.GetFactionFromTeamType("allies");
 
         int numberOfAdditionalAllyLances = Main.Settings.ActiveAdditionalLances.Allies.SelectNumberOfAdditionalLances(faction, "allies");
+
+        // Allow contract-specific settings overrides to force their respective setting
+        if (Main.Settings.ActiveContractSettings.Has(ContractSettingsOverrides.AdditionalLances_AllyLanceCountOverride)) {
+          numberOfAdditionalAllyLances = Main.Settings.ActiveContractSettings.GetInt(ContractSettingsOverrides.AdditionalLances_AllyLanceCountOverride);
+          Main.Logger.Log($"[{this.GetType().Name}] Using contract-specific settings override for contract '{MissionControl.Instance.CurrentContract.Name}'. Ally lance count will be '{numberOfAdditionalAllyLances}'.");
+        } else if (Main.Settings.AdditionalLanceSettings.MatchAllyLanceCountToEnemy) {
+          Main.Logger.LogDebug($"[{this.GetType().Name}] 'MatchAllyLanceCountToEnemy' is on. Ally lance count will be {numberOfAdditionalEnemyLances}");
+          numberOfAdditionalAllyLances = numberOfAdditionalEnemyLances;
+        }
+
         for (int i = 0; i < numberOfAdditionalAllyLances; i++) {
-          new AddEmployerLanceBatch(this, allyOrientationKey, allyLookDirection, minAllyDistance, maxAllyDistance);
+          new AddEmployerLanceBatch(this, allyOrientationKey, allyLookDirection, mustBeBeyondDistance, mustBeWithinDistance);
         }
       }
     }
@@ -236,9 +293,20 @@ namespace MissionControl.Rules {
       string mapId = MissionControl.Instance.ContractMapName;
       string contractTypeName = MissionControl.Instance.CurrentContractType;
       float size = Main.Settings.ExtendedBoundaries.GetSizePercentage(mapId, contractTypeName);
+
+      // Allow contract-specific settings overrides to force their respective setting
+      if (Main.Settings.ActiveContractSettings.Has(ContractSettingsOverrides.ExtendedBoundaries_IncreaseBoundarySizeByPercentage)) {
+        size = Main.Settings.ActiveContractSettings.GetInt(ContractSettingsOverrides.ExtendedBoundaries_IncreaseBoundarySizeByPercentage);
+        Main.Logger.Log($"[{this.GetType().Name}] Using contract-specific settings override for contract '{MissionControl.Instance.CurrentContract.Name}'. IncreaseBoundarySizeByPercentage will be '{size}'.");
+      }
+
       Main.Logger.Log($"[{this.GetType().Name}] Maximising Boundary Size for '{mapId}.{contractTypeName}' to '{size}'");
 
       this.EncounterLogic.Add(new MaximiseBoundarySize(this, size));
+    }
+
+    private void BuildAi() {
+      EncounterLogic.Add(new IssueFollowLanceOrderTrigger(new List<string>() { Tags.EMPLOYER_TEAM }, IssueAIOrderTo.ToLance, new List<string>() { Tags.PLAYER_1_TEAM }));
     }
   }
 }

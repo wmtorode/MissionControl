@@ -9,6 +9,7 @@ using HBS.Collections;
 
 using MissionControl.Data;
 using MissionControl.Rules;
+using MissionControl.Config;
 using MissionControl.EncounterFactories;
 
 namespace MissionControl.Logic {
@@ -17,6 +18,7 @@ namespace MissionControl.Logic {
     private LogicState state;
     private List<LanceSpawnerGameLogic> lanceSpawners;
     private List<string[]> spawnKeys = new List<string[]>();
+    private List<string> lancesToSkip = new List<string>();
 
     public AddExtraLanceSpawnPoints(EncounterRules encounterRules, LogicState state) {
       this.encounterRules = encounterRules;
@@ -29,24 +31,45 @@ namespace MissionControl.Logic {
       EncounterLayerData encounterLayerData = MissionControl.Instance.EncounterLayerData;
       ContractOverride contractOverride = contract.Override;
 
+      lancesToSkip = (List<string>)state.GetObject("LancesToSkip");
       lanceSpawners = new List<LanceSpawnerGameLogic>(encounterLayerData.gameObject.GetComponentsInChildren<LanceSpawnerGameLogic>());
 
       TeamOverride targetTeamOverride = contractOverride.targetTeam;
       TeamOverride employerTeamOverride = contractOverride.employerTeam;
 
-      IncreaseLanceSpawnPoints(contractOverride, targetTeamOverride);
-      IncreaseLanceSpawnPoints(contractOverride, employerTeamOverride);
+      if (Main.Settings.ActiveContractSettings.Has(ContractSettingsOverrides.ExtendedLances_EnemyLanceSizeOverride)) {
+        int lanceSizeOverride = Main.Settings.ActiveContractSettings.GetInt(ContractSettingsOverrides.ExtendedLances_EnemyLanceSizeOverride);
+        Main.Logger.Log($"[AddExtraLanceSpawnPoints] Using contract-specific settings override for contract '{MissionControl.Instance.CurrentContract.Name}'. Enemy lance size will be '{lanceSizeOverride}'.");
+        IncreaseLanceSpawnPoints(contractOverride, targetTeamOverride, lanceSizeOverride);
+      } else {
+        IncreaseLanceSpawnPoints(contractOverride, targetTeamOverride);
+      }
+
+      if (Main.Settings.ActiveContractSettings.Has(ContractSettingsOverrides.ExtendedLances_AllyLanceSizeOverride)) {
+        int lanceSizeOverride = Main.Settings.ActiveContractSettings.GetInt(ContractSettingsOverrides.ExtendedLances_AllyLanceSizeOverride);
+        Main.Logger.Log($"[AddExtraLanceSpawnPoints] Using contract-specific settings override for contract '{MissionControl.Instance.CurrentContract.Name}'. Ally lance size will be '{lanceSizeOverride}'.");
+        IncreaseLanceSpawnPoints(contractOverride, employerTeamOverride, lanceSizeOverride);
+      } else {
+        IncreaseLanceSpawnPoints(contractOverride, employerTeamOverride);
+      }
 
       state.Set("ExtraLanceSpawnKeys", spawnKeys);
     }
 
-    private void IncreaseLanceSpawnPoints(ContractOverride contractOverride, TeamOverride teamOverride) {
+    private void IncreaseLanceSpawnPoints(ContractOverride contractOverride, TeamOverride teamOverride, int lanceSizeOverride = -1) {
       List<LanceOverride> lanceOverrides = teamOverride.lanceOverrideList;
-      int factionLanceSize = Main.Settings.ExtendedLances.GetFactionLanceSize(teamOverride.faction.ToString());
+      int factionLanceSize = lanceSizeOverride <= -1 ? Main.Settings.ExtendedLances.GetFactionLanceSize(teamOverride.faction.ToString()) : lanceSizeOverride;
+      List<string> lancesToDelete = new List<string>();
 
-      foreach (LanceOverride lanceOverride in lanceOverrides) {
+      for (int i = 0; i < lanceOverrides.Count; i++) {
+        LanceOverride lanceOverride = lanceOverrides[i];
         bool isManualLance = lanceOverride.lanceDefId == "Manual";
         int numberOfUnitsInLance = lanceOverride.unitSpawnPointOverrideList.Count;
+
+        if (lancesToSkip.Contains(lanceOverride.GUID)) {
+          Main.LogDebug($"[AddExtraLanceSpawnPoints] [Faction:{teamOverride.faction}] Detected a lance to skip. Skipping.");
+          continue;
+        }
 
         if (lanceOverride.IsATurretLance()) {
           Main.LogDebug($"[AddExtraLanceSpawnPoints] [Faction:{teamOverride.faction}] Detected a turret lance Ignoring for Extended Lances.");
@@ -57,8 +80,6 @@ namespace MissionControl.Logic {
           Main.LogDebug($"[AddExtraLanceSpawnPoints] [Faction:{teamOverride.faction}] Detected a lance that is set to manual but no units were manually specified. This is a bad contract json setup. Fix it! Ignoring for Extended Lances");
           continue;
         }
-
-        ApplyDifficultyMod(teamOverride, lanceOverride);
 
         if ((numberOfUnitsInLance < factionLanceSize) && numberOfUnitsInLance > 0) {
           // This is usually from a 'tagged' lance being selected which has less lance members than the faction lance size
@@ -92,13 +113,22 @@ namespace MissionControl.Logic {
             string orientationKey = $"{spawnerName}.{orientationUnit.name}";
             encounterRules.ObjectLookup[orientationKey] = orientationUnit;
 
-            for (int i = unitSpawnPoints.Count; i < numberOfUnitsInLance; i++) {
+            for (int j = unitSpawnPoints.Count; j < numberOfUnitsInLance; j++) {
               Vector3 randomLanceSpawn = unitSpawnPoints.GetRandom().transform.localPosition;
               Vector3 spawnPositon = SceneUtils.GetRandomPositionFromTarget(randomLanceSpawn, 24, 100);
               spawnPositon = spawnPositon.GetClosestHexLerpedPointOnGrid();
 
-              Main.Logger.Log($"[AddExtraLanceSpawnPoints] [Faction:{teamOverride.faction}] Creating lance '{lanceOverride.name}' spawn point 'UnitSpawnPoint{i + 1}'");
-              UnitSpawnPointGameLogic unitSpawnGameLogic = LanceSpawnerFactory.CreateUnitSpawnPoint(lanceSpawner.gameObject, $"UnitSpawnPoint{i + 1}", spawnPositon, lanceOverride.unitSpawnPointOverrideList[i].unitSpawnPoint.EncounterObjectGuid);
+              // Ensure spawn position isn't on another unit spawn. Give up if one isn't possible.
+              int failSafe = 0;
+              while (spawnPositon.IsTooCloseToAnotherSpawn()) {
+                spawnPositon = SceneUtils.GetRandomPositionFromTarget(randomLanceSpawn, 24, 100);
+                spawnPositon = spawnPositon.GetClosestHexLerpedPointOnGrid();
+                if (failSafe > 20) break;
+                failSafe++;
+              }
+
+              Main.Logger.Log($"[AddExtraLanceSpawnPoints] [Faction:{teamOverride.faction}] Creating lance '{lanceOverride.name}' spawn point 'UnitSpawnPoint{j + 1}'");
+              UnitSpawnPointGameLogic unitSpawnGameLogic = LanceSpawnerFactory.CreateUnitSpawnPoint(lanceSpawner.gameObject, $"UnitSpawnPoint{j + 1}", spawnPositon, lanceOverride.unitSpawnPointOverrideList[j].unitSpawnPoint.EncounterObjectGuid);
 
               string spawnKey = $"{spawnerName}.{unitSpawnGameLogic.gameObject.name}";
               encounterRules.ObjectLookup[spawnKey] = unitSpawnGameLogic.gameObject;
@@ -107,6 +137,18 @@ namespace MissionControl.Logic {
           }
         } else {
           Main.Logger.LogWarning($"[AddExtraLanceSpawnPoints] [Faction:{teamOverride.faction}] Spawner is null for {lanceOverride.lanceSpawner.EncounterObjectGuid}. This is probably data from a restarted contract that hasn't been cleared up. It can be safely ignored.");
+          lancesToDelete.Add(lanceOverride.lanceSpawner.EncounterObjectGuid);
+        }
+      }
+
+      for (int i = (lanceOverrides.Count - 1); i >= 0; i--) {
+        LanceOverride lanceOverride = lanceOverrides[i];
+
+        foreach (string lanceToDeleteByGuid in lancesToDelete) {
+          if (lanceOverride.lanceSpawner.EncounterObjectGuid == lanceToDeleteByGuid) {
+            Main.Logger.LogWarning($"[AddExtraLanceSpawnPoints] [Faction:{teamOverride.faction}] Removing old lance data from contract. Deleting lance '{lanceToDeleteByGuid}'");
+            lanceOverrides.Remove(lanceOverride);
+          }
         }
       }
     }
@@ -116,20 +158,11 @@ namespace MissionControl.Logic {
         UnitSpawnPointOverride originalUnitSpawnPointOverride = lanceOverride.GetAnyTaggedLanceMember();
         if (originalUnitSpawnPointOverride == null) originalUnitSpawnPointOverride = lanceOverride.unitSpawnPointOverrideList[0];
         UnitSpawnPointOverride unitSpawnPointOverride = originalUnitSpawnPointOverride.DeepCopy();
+        unitSpawnPointOverride.customUnitName = "";
         TagSet companyTags = new TagSet(UnityGameInstance.BattleTechGame.Simulation.CompanyTags);
 
         unitSpawnPointOverride.GenerateUnit(MetadataDatabase.Instance, UnityGameInstance.Instance.Game.DataManager, lanceOverride.selectedLanceDifficulty, lanceOverride.name, null, i, DataManager.Instance.GetSimGameCurrentDate(), companyTags);
         lanceOverride.unitSpawnPointOverrideList.Add(unitSpawnPointOverride);
-      }
-    }
-
-    private void ApplyDifficultyMod(TeamOverride teamOverride, LanceOverride lanceOverride) {
-      int previousAjustedDifficulty = lanceOverride.lanceDifficultyAdjustment;
-      int updatedLanceDifficultyAdjustment = Main.Settings.ExtendedLances.GetFactionLanceDifficulty(teamOverride.faction, lanceOverride);
-
-      if (previousAjustedDifficulty != updatedLanceDifficultyAdjustment) {
-        Main.Logger.Log($"[AddExtraLanceSpawnPoints.ApplyDifficultyMod] [Faction:{teamOverride.faction}] Changing lance '{lanceOverride.name}' adjusted difficulty from '{lanceOverride.lanceDifficultyAdjustment}' to '{updatedLanceDifficultyAdjustment}'");
-        lanceOverride.lanceDifficultyAdjustment = updatedLanceDifficultyAdjustment;
       }
     }
   }

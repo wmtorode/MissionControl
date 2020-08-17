@@ -18,8 +18,12 @@ namespace MissionControl.Logic {
     private bool useOrientationTarget = false;
     private GameObject orientationTarget;
     private RectExtensions.RectEdge edge = RectExtensions.RectEdge.ANY;
-    private bool useMiniumDistance = false;
-    private float minimumDistance = 400f;
+
+    private WithinOrBeyondDistanceType distanceCheckType = WithinOrBeyondDistanceType.NONE;
+    private float distanceCheck = 400f;
+    private float mustBeWithinDistance = 400f;
+    private float mustBeBeyondDistance = 400f;
+
     private bool clusterUnits = false;
 
     private int AttemptCountMax { get; set; } = 3;
@@ -37,12 +41,36 @@ namespace MissionControl.Logic {
       this.clusterUnits = clusterUnits;
     }
 
-    public SpawnLanceAtEdgeOfBoundary(EncounterRules encounterRules, string lanceKey, string orientationTargetKey, float minimumDistance, bool clusterUnits = false) : base(encounterRules) {
+    public SpawnLanceAtEdgeOfBoundary(EncounterRules encounterRules, string lanceKey, string orientationTargetKey, float mustBeBeyondDistance, bool clusterUnits = false) : base(encounterRules) {
       this.lanceKey = lanceKey;
       this.useOrientationTarget = true;
       this.orientationTargetKey = orientationTargetKey;
-      this.useMiniumDistance = true;
-      this.minimumDistance = minimumDistance;
+      this.distanceCheckType = WithinOrBeyondDistanceType.MUST_BE_BEYOND;
+      this.distanceCheck = mustBeBeyondDistance;
+      this.clusterUnits = clusterUnits;
+    }
+
+    public SpawnLanceAtEdgeOfBoundary(EncounterRules encounterRules, string lanceKey, string orientationTargetKey, WithinOrBeyondDistanceType distanceCheckType, float checkDistance, bool clusterUnits = false) : base(encounterRules) {
+      this.lanceKey = lanceKey;
+      this.useOrientationTarget = true;
+      this.orientationTargetKey = orientationTargetKey;
+      this.distanceCheckType = distanceCheckType;
+      this.distanceCheck = checkDistance;
+      this.clusterUnits = clusterUnits;
+    }
+
+    /*
+    * Beyond = Must be beyond X distance
+    * Within = Must be within Y distance
+    */
+    public SpawnLanceAtEdgeOfBoundary(EncounterRules encounterRules, string lanceKey, string orientationTargetKey, float mustBeBeyondDistance, float mustBeWithinDistance, bool clusterUnits = false) : base(encounterRules) {
+      this.lanceKey = lanceKey;
+      this.useOrientationTarget = true;
+      this.orientationTargetKey = orientationTargetKey;
+      this.distanceCheckType = WithinOrBeyondDistanceType.BOTH;
+      this.mustBeBeyondDistance = mustBeBeyondDistance;
+      this.mustBeWithinDistance = mustBeWithinDistance;
+      this.distanceCheck = mustBeBeyondDistance;
       this.clusterUnits = clusterUnits;
     }
 
@@ -50,7 +78,7 @@ namespace MissionControl.Logic {
       if (!inited || forced) {
         Main.LogDebug($"[SpawnLanceAtEdgeBoundary] Forcing Re-init");
         Main.LogDebug($"[SpawnLanceAtEdgeBoundary] Orientation target of '{orientationTarget.name}' at '{orientationTarget.transform.position}'. Attempting to get closest valid path finding hex.");
-        validOrientationTargetPosition = GetClosestValidPathFindingHex(orientationTarget.transform.position, $"OrientationTarget.{orientationTarget.name}");
+        validOrientationTargetPosition = GetClosestValidPathFindingHex(orientationTarget, orientationTarget.transform.position, $"OrientationTarget.{orientationTarget.name}");
 
         // Cluster units to make a tigher spread - makes hitting a successful spawn position generally easier
         // TODO: Investigate if this causes bad grid placement since there's no 'IsSpawnValid' check in this call stack
@@ -66,7 +94,8 @@ namespace MissionControl.Logic {
     }
 
     public override void Run(RunPayload payload) {
-      GetObjectReferences();
+      if (!GetObjectReferences()) return;
+
       SaveSpawnPositions(lance);
       Main.Logger.Log($"[SpawnLanceAtEdgeOfBoundary] Attemping for '{lance.name}'. Attempt: '{AttemptCount}/{AttemptCountMax}' and Edge Check: '{EdgeCheckCount}/{EdgeCheckMax}'");
       AttemptCount++;
@@ -81,29 +110,30 @@ namespace MissionControl.Logic {
       EncounterBoundaryRectGameLogic boundaryLogic = boundary.GetComponent<EncounterBoundaryRectGameLogic>();
       Rect boundaryRec = chunkBoundary.GetEncounterBoundaryRectBounds();
       Rect usableBounds = boundaryRec.GenerateUsableBoundary();
+
+      if (AttemptCount > AttemptCountMax) {  // Attempt to spawn on the selected edge. If it's not possible, select another edge
+        edge = RectExtensions.RectEdge.ANY;
+        if (EdgeCheckCount >= EdgeCheckMax) {
+          HandleFallback(payload, this.lanceKey, this.orientationTargetKey);
+          return;
+        }
+      }
+
       RectEdgePosition xzEdge = usableBounds.CalculateRandomXZEdge(boundary.transform.position, edge);
 
       Vector3 lancePosition = lance.transform.position.GetClosestHexLerpedPointOnGrid();
       Vector3 newSpawnPosition = new Vector3(xzEdge.Position.x, lancePosition.y, xzEdge.Position.z);
-      newSpawnPosition = GetClosestValidPathFindingHex(newSpawnPosition, $"NewSpawnPosition.{lance.name}", IsLancePlayerLance(lanceKey) ? orientationTarget.transform.position : Vector3.zero, 2);
+      newSpawnPosition = GetClosestValidPathFindingHex(lance, newSpawnPosition, $"NewSpawnPosition.{lance.name}", IsLancePlayerLance(lanceKey) ? orientationTarget.transform.position : Vector3.zero, 2);
       lance.transform.position = newSpawnPosition;
-      
+
       Main.LogDebug($"[SpawnLanceAtEdgeBoundary] Attempting to spawn lance at point on lerped grid '{newSpawnPosition}'");
 
       if (useOrientationTarget) RotateToTarget(lance, orientationTarget);
 
-      if (!useMiniumDistance || IsWithinBoundedDistanceOfTarget(newSpawnPosition, validOrientationTargetPosition, minimumDistance)) {
+      if (IsDistanceSetupValid(newSpawnPosition)) {
         List<GameObject> invalidLanceSpawns = GetInvalidLanceMemberSpawns(lance, validOrientationTargetPosition);
 
         if (invalidLanceSpawns.Count > 0) {
-          if (AttemptCount > AttemptCountMax) {  // Attempt to spawn on the selected edge. If it's not possible, select another edge
-            edge = RectExtensions.RectEdge.ANY;
-            if (EdgeCheckCount >= EdgeCheckMax) {
-              HandleFallback(payload, this.lanceKey, this.orientationTargetKey);
-              return;
-            }
-          }
-
           if (invalidLanceSpawns.Count <= 2) {
             Main.Logger.Log($"[SpawnLanceAtEdgeOfBoundary] Fitting invalid lance member spawns");
             foreach (GameObject invalidSpawn in invalidLanceSpawns) {
@@ -121,35 +151,69 @@ namespace MissionControl.Logic {
         }
       } else {
         CheckAttempts();
-        Main.LogDebug("[SpawnLanceAtEdgeOfBoundary] Spawn is too close to the target. Selecting a new spawn.");
+        Main.LogDebug("[SpawnLanceAtEdgeOfBoundary] Spawn is too close or too far to/from the target. Selecting a new spawn.");
         edge = xzEdge.Edge;
         Run(payload);
       }
     }
 
+    public bool IsDistanceSetupValid(Vector3 newSpawnPosition) {
+      if (distanceCheckType == WithinOrBeyondDistanceType.NONE) return true;
+
+      switch (distanceCheckType) {
+        case WithinOrBeyondDistanceType.NONE: return true;
+        case WithinOrBeyondDistanceType.MUST_BE_WITHIN: {
+          return IsWithinBoundedDistanceOfTarget(newSpawnPosition, validOrientationTargetPosition, distanceCheck);
+        }
+        case WithinOrBeyondDistanceType.MUST_BE_BEYOND: {
+          return IsBeyondBoundedDistanceOfTarget(newSpawnPosition, validOrientationTargetPosition, distanceCheck);
+        }
+        case WithinOrBeyondDistanceType.BOTH: {
+          bool success = IsWithinBoundedDistanceOfTarget(newSpawnPosition, validOrientationTargetPosition, mustBeWithinDistance);
+          if (success) success = IsBeyondBoundedDistanceOfTarget(newSpawnPosition, validOrientationTargetPosition, mustBeBeyondDistance);
+          return success;
+        }
+        default: return false;
+      }
+    }
+
     private void SpawnLanceMember(GameObject spawnPoint, Vector3 anchorPoint) {
       Main.Logger.Log($"[SpawnLanceAtEdgeOfBoundary.SpawnLanceMember] Fitting member '{spawnPoint.name}' at anchor point '{anchorPoint}'");
-      Vector3 newSpawnLocation = GetClosestValidPathFindingHex(anchorPoint, $"SpawnLanceMember.{spawnPoint.name}", IsLancePlayerLance(lanceKey) ? orientationTarget.transform.position : Vector3.zero, 2);
-      spawnPoint.transform.position = newSpawnLocation;
+      Vector3 newSpawnLocation = GetClosestValidPathFindingHex(spawnPoint, anchorPoint, $"SpawnLanceMember.{spawnPoint.name}", IsLancePlayerLance(lanceKey) ? orientationTarget.transform.position : Vector3.zero, 2);
+
+      if (!newSpawnLocation.IsTooCloseToAnotherSpawn(spawnPoint)) {
+        spawnPoint.transform.position = newSpawnLocation;
+      } else {
+        SpawnLanceMember(spawnPoint, anchorPoint);
+      }
     }
 
     private void CheckAttempts() {
       if (AttemptCount > AttemptCountMax) {
         EdgeCheckCount++;
         AttemptCount = 0;
-        Main.LogDebug($"[SpawnLanceAtEdgeOfBoundary] Cannot find a suitable lance spawn within the boundaries of {minimumDistance}. Widening search");
-        minimumDistance -= 50f;
-        if (minimumDistance <= 0f) minimumDistance = 0f;
+
+        if (distanceCheckType == WithinOrBeyondDistanceType.NONE || distanceCheckType == WithinOrBeyondDistanceType.MUST_BE_BEYOND) {
+          Main.LogDebug($"[SpawnLanceAtEdgeOfBoundary] Cannot find a suitable lance spawn beyond the boundaries of {distanceCheck}. Widening search");
+          distanceCheck -= 50f;
+          if (distanceCheck <= 0f) distanceCheck = 0f;
+        } else {
+          Main.LogDebug($"[SpawnLanceAtEdgeOfBoundary] Cannot find a suitable lance spawn within the boundaries of {distanceCheck}. Widening search");
+          distanceCheck += 50f;
+        }
       }
     }
 
-    protected override void GetObjectReferences() {
+    protected override bool GetObjectReferences() {
       this.EncounterRules.ObjectLookup.TryGetValue(lanceKey, out lance);
       this.EncounterRules.ObjectLookup.TryGetValue(orientationTargetKey, out orientationTarget);
 
       if (lance == null) {
-        Main.Logger.LogError("[SpawnLanceAtEdgeOfBoundary] Object references are null");
+        Main.Logger.LogWarning($"[SpawnLanceAtEdgeOfBoundary] Object reference for target '{lanceKey}' is null. This will be handled gracefully.");
+        return false;
       }
+
+      return true;
     }
   }
 }

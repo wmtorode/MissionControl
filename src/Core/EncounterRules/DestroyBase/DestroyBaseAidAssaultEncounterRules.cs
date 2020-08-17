@@ -1,11 +1,5 @@
 using UnityEngine;
-using System;
-using System.Collections;
-using System.Collections.Generic;
 
-using BattleTech;
-
-using MissionControl.Config;
 using MissionControl.Logic;
 
 namespace MissionControl.Rules {
@@ -24,7 +18,7 @@ namespace MissionControl.Rules {
       if (!MissionControl.Instance.IsRandomSpawnsAllowed()) return;
 
       Main.Logger.Log("[DestroyBaseAidAssaultEncounterRules] Building player spawn rule");
-      EncounterLogic.Add(new SpawnLanceAtEdgeOfBoundary(this, "SpawnerPlayerLance", "PlotBase"));
+      EncounterLogic.Add(new SpawnLanceAtEdgeOfBoundary(this, "SpawnerPlayerLance", "PlotBase", 400));
     }
 
     public override void LinkObjectReferences(string mapName) {

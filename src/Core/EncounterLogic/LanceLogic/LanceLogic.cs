@@ -21,9 +21,11 @@ namespace MissionControl.Logic {
       FactionDef faction = MissionControl.Instance.GetFactionFromTeamType(teamType);
       string factionName = (faction == null) ? "UNKNOWN" : faction.Name;
       int factionRep = (MissionControl.Instance.IsSkirmish()) ? 0 : UnityGameInstance.Instance.Game.Simulation.GetRawReputation(faction.FactionValue);
+      int mrbRating = (MissionControl.Instance.IsSkirmish()) ? 0 : UnityGameInstance.Instance.Game.Simulation.GetRawReputation(FactionEnumeration.GetMercenaryReviewBoardFactionValue());
+      int mrbLevel = (MissionControl.Instance.IsSkirmish()) ? 0 : UnityGameInstance.Instance.Game.Simulation.GetCurrentMRBLevel();
       bool useElites = MissionControl.Instance.ShouldUseElites(faction, teamType);
       Config.Lance activeAdditionalLance = Main.Settings.ActiveAdditionalLances.GetActiveAdditionalLanceByTeamType(teamType);
-      List<string> lancePoolKeys = Main.Settings.ActiveAdditionalLances.GetLancePoolKeys(teamType, biome, contractType, factionName, factionRep);
+      List<string> lancePoolKeys = Main.Settings.ActiveAdditionalLances.GetLancePoolKeys(teamType, biome, contractType, factionName, factionRep, mrbLevel, mrbRating);
 
       int index = UnityEngine.Random.Range(0, lancePoolKeys.Count);
       string selectedLanceKey = lancePoolKeys[index];
@@ -45,8 +47,8 @@ namespace MissionControl.Logic {
           }
         }
 
-        Main.Logger.LogError($"[SelectAppropriateLanceOverride] MLanceOverride of '{selectedLanceKey}' not found. Defaulting to 'Generic_Battle_Lance'");
-        return DataManager.Instance.GetLanceOverride("Generic_Battle_Lance");
+        Main.Logger.LogError($"[SelectAppropriateLanceOverride] MLanceOverride of '{selectedLanceKey}' not found. Defaulting to 'Generic_Light_Battle_Lance'");
+        return DataManager.Instance.GetLanceOverride("Generic_Light_Battle_Lance");
       }
     }
   }

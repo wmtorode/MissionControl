@@ -1,16 +1,21 @@
 using UnityEngine;
 
 using System;
+using System.Linq;
 using System.Collections.Generic;
 
 using BattleTech;
 using BattleTech.Data;
+using BattleTech.Framework;
 
+using MissionControl.Data;
 using MissionControl.Logic;
 using MissionControl.Rules;
 using MissionControl.Utils;
 using MissionControl.EncounterFactories;
 using MissionControl.ContractTypeBuilders;
+using MissionControl.Patches;
+using MissionControl.Config;
 
 using Newtonsoft.Json.Linq;
 
@@ -24,7 +29,7 @@ namespace MissionControl {
       }
     }
 
-    public Contract CurrentContract { get; private set; }
+    public Contract CurrentContract { get; set; }
     public string ContractMapName { get; private set; }
     public string CurrentContractType { get; private set; } = "INVALID_UNSET";
     public ContractTypeValue CurrentContractTypeValue { get; private set; }
@@ -36,18 +41,34 @@ namespace MissionControl {
     public GameObject EncounterLayerGameObject { get; private set; }
     public EncounterLayerData EncounterLayerData { get; private set; }
 
+    public int PlayerLanceDropDifficultyValue { get; set; }
+    public float PlayerLanceDropSkullRating { get; set; }
+    public float PlayerLanceDropTonnage { get; set; }
+
     // Only populated for custom contract types
     public EncounterLayer_MDD EncounterLayerMDD { get; private set; }
     public bool IsCustomContractType { get; set; } = false;
+    public List<object[]> QueuedBuildingMounts { get; set; } = new List<object[]>();
 
     public HexGrid HexGrid { get; private set; }
 
     public bool IsContractValid { get; private set; } = false;
     public bool IsMCLoadingFinished { get; set; } = false;
+    public bool IsLoadingFromSave {
+      get {
+        if (UnityGameInstance.Instance.Game.Combat == null) return false;
+        return UnityGameInstance.Instance.Game.Combat.IsLoadingFromSave;
+      }
+    }
 
     private Dictionary<string, List<Type>> AvailableEncounters = new Dictionary<string, List<Type>>();
 
     public Dictionary<ContractStats, object> ContractStats = new Dictionary<ContractStats, object>();
+
+    // Used at Contract generation
+    public StarSystem System { get; set; }
+    public Dictionary<int, List<ContractOverride>> PotentialContracts { get; set; } = new Dictionary<int, List<ContractOverride>>();
+    // End
 
     private MissionControl() {
       LoadEncounterRules();
@@ -78,6 +99,9 @@ namespace MissionControl {
 
       AddEncounter("ThreeWayBattle", typeof(BattlePlusEncounterRules));
 
+      // Custom Contract Types
+      AddEncounter("Blackout", typeof(BlackoutEncounterRules));
+
       // Skirmish
       if (Main.Settings.DebugSkirmishMode) AddEncounter("ArenaSkirmish", typeof(DebugArenaSkirmishEncounterRules));
     }
@@ -96,7 +120,11 @@ namespace MissionControl {
     }
 
     public List<string> GetAllContractTypes() {
-      return new List<string>(AvailableEncounters.Keys);
+      List<string> contractTypesWithSpecificEncounterRules = new List<string>(AvailableEncounters.Keys);
+      List<string> customContractTypes = DataManager.Instance.GetCustomContractTypes();
+
+      List<string> contractTypes = contractTypesWithSpecificEncounterRules.Union(customContractTypes).ToList();
+      return contractTypes;
     }
 
     public void InitSceneData() {
@@ -139,7 +167,7 @@ namespace MissionControl {
       string contractTypeName = CurrentContract.ContractTypeValue.Name;
 
       if (DataManager.Instance.AvailableCustomContractTypeBuilds.ContainsKey(contractTypeName)) {
-        JObject contractTypeBuild = DataManager.Instance.AvailableCustomContractTypeBuilds[contractTypeName];
+        JObject contractTypeBuild = DataManager.Instance.GetAvailableCustomContractTypeBuilds(contractTypeName, EncounterLayerMDD.EncounterLayerID);
         ContractTypeBuilder contractTypeBuilder = new ContractTypeBuilder(encounterLayerGo, contractTypeBuild);
         contractTypeBuilder.Build();
       } else {
@@ -148,25 +176,63 @@ namespace MissionControl {
     }
 
     public void SetContract(Contract contract) {
-      Main.Logger.Log($"[MissionControl] Setting contract '{contract.Name}'");
+      Main.Logger.Log($"[MissionControl] Setting contract '{contract.Name}' for contract type '{contract.ContractTypeValue.Name}'");
       CurrentContract = contract;
-      SetActiveAdditionalLances(contract);
-      Main.Logger.Log($"[MissionControl] Contract map is '{contract.mapName}'");
-      ContractMapName = contract.mapName;
-      SetContractType(CurrentContract.ContractTypeValue);
-      AiManager.Instance.ResetCustomBehaviourVariableScopes();
+
+      if (AllowMissionControl()) {
+        Main.Logger.Log($"[MissionControl] Player drop difficulty: '{PlayerLanceDropDifficultyValue}' (Skull value '{PlayerLanceDropSkullRating}')");
+        Main.Logger.Log($"[MissionControl] Player drop tonnage: '{PlayerLanceDropTonnage}' tons");
+
+        IsMCLoadingFinished = false;
+        SetActiveAdditionalLances(contract);
+        Main.Logger.Log($"[MissionControl] Contract map is '{contract.mapName}'");
+        ContractMapName = contract.mapName;
+        SetContractType(CurrentContract.ContractTypeValue);
+        AiManager.Instance.ResetCustomBehaviourVariableScopes();
+      } else {
+        Main.Logger.Log($"[MissionControl] Mission Control is not allowed to run. Possibly a story mission or flashpoint contract.");
+        EncounterRules = null;
+        EncounterRulesName = null;
+        IsMCLoadingFinished = true;
+      }
+
       ContractStats.Clear();
+      ClearOldContractData();
+      ClearOldCaches();
+    }
+
+    private void ClearOldContractData() {
+      Main.Logger.Log($"[MissionControl] Clearing old contract data");
+
+      // Clear old lance data
+      if (CurrentContract != null) {
+        // Old Lances
+        CurrentContract.Override.targetTeam.lanceOverrideList =
+          CurrentContract.Override.targetTeam.lanceOverrideList.Where(lanceOverride => !(lanceOverride is MLanceOverride)).ToList();
+        CurrentContract.Override.employerTeam.lanceOverrideList =
+          CurrentContract.Override.employerTeam.lanceOverrideList.Where(lanceOverride => !(lanceOverride is MLanceOverride)).ToList();
+
+        // Old Objectives
+        CurrentContract.Override.contractObjectiveList =
+         CurrentContract.Override.contractObjectiveList.Where(contractObjective => !contractObjective.description.StartsWith("MC ")).ToList();
+      }
+    }
+
+    private void ClearOldCaches() {
+      Main.Logger.Log($"[MissionControl] Clearing old caches");
+
+      AssetBundleManagerGetAssetFromBundlePatch.ClearLookup();
     }
 
     public void SetActiveAdditionalLances(Contract contract) {
       if (Main.Settings.AdditionalLanceSettings.SkullValueMatters) {
         if (!IsSkirmish(contract) || (IsSkirmish(contract) && !Main.Settings.AdditionalLanceSettings.UseGeneralProfileForSkirmish)) {
           int difficulty = contract.Override.finalDifficulty;
-          Main.LogDebug($"[MissionControl] Difficulty '{difficulty}' (Skull value '{(float)difficulty / 2f}')");
+          Main.LogDebug($"[MissionControl] Contract difficulty '{difficulty}' (Skull value '{(float)difficulty / 2f}')");
           if (Main.Settings.AdditionalLanceSettings.BasedOnVisibleSkullValue) {
             difficulty = contract.Override.GetUIDifficulty();
           }
-          Main.LogDebug($"[MissionControl] Visisble Difficulty '{contract.Override.GetUIDifficulty()}' (Skull value '{(float)contract.Override.GetUIDifficulty() / 2f}')");
+          Main.LogDebug($"[MissionControl] Visible Contract difficulty '{contract.Override.GetUIDifficulty()}' (Skull value '{(float)contract.Override.GetUIDifficulty() / 2f}')");
 
           if (Main.Settings.AdditionalLances.ContainsKey(difficulty)) {
             Main.Logger.Log($"[MissionControl] Using AdditionalLances for difficulty '{difficulty}' (Skull value '{(float)difficulty / 2f}')");
@@ -185,30 +251,53 @@ namespace MissionControl {
       }
     }
 
+    public void SetContractSettingsOverride() {
+      if (!IsSkirmish(CurrentContract)) {
+        string contractId = CurrentContract.Override.ID;
+        string type = IsAnyFlashpointContract() ? "flashpoint" : "contract";
+
+        if (Main.Settings.ContractSettingsOverrides.ContainsKey(contractId)) {
+          Main.Logger.Log($"[MissionControl] Setting a {type} MC settings override for '{contractId}'.");
+          Main.Settings.ActiveContractSettings = Main.Settings.ContractSettingsOverrides[contractId];
+        } else {
+          Main.Logger.Log($"[MissionControl] No {type} MC settings override found for '{contractId}'.");
+          Main.Settings.ActiveContractSettings = new Config.ContractSettingsOverrides();
+        }
+      } else {
+        Main.Settings.ActiveContractSettings = new Config.ContractSettingsOverrides();
+      }
+    }
+
     /*
       Future proofed method to allow for string custom contract type names
       instead of relying only on the enum values
     */
-    public bool SetContractType(ContractTypeValue contractTypeValue) {
-      List<Type> encounters = null;
+    public void SetContractType(ContractTypeValue contractTypeValue) {
+      if (AllowMissionControl()) {
+        List<Type> encounters = null;
 
-      string type = contractTypeValue.Name;
-      CurrentContractType = type;
+        string type = contractTypeValue.Name;
+        CurrentContractType = type;
 
-      if (AvailableEncounters.ContainsKey(type)) {
-        encounters = AvailableEncounters[type];
+        if (AvailableEncounters.ContainsKey(type)) {
+          encounters = AvailableEncounters[type];
 
-        int index = UnityEngine.Random.Range(0, encounters.Count);
-        Type selectedEncounter = encounters[index];
-        Main.Logger.Log($"[MissionControl] Setting contract type to '{type}' and using Encounter Rule of '{selectedEncounter.Name}'");
-        SetEncounterRule(selectedEncounter);
+          int index = UnityEngine.Random.Range(0, encounters.Count);
+          Type selectedEncounter = encounters[index];
+          Main.Logger.Log($"[MissionControl] Setting contract type to '{type}' and using Encounter Rule of '{selectedEncounter.Name}'");
+          SetEncounterRule(selectedEncounter);
+        } else {
+          Main.Logger.Log($"[MissionControl] Unknown contract / encounter type of '{type}'. Using fallback ruleset.");
+          SetEncounterRule(typeof(FallbackEncounterRules));
+        }
+
+        IsContractValid = true;
       } else {
-        Main.Logger.Log($"[MissionControl] Unknown contract / encounter type of '{type}'. Using fallback ruleset.");
-        SetEncounterRule(typeof(FallbackEncounterRules));
+        Main.Logger.Log($"[MissionControl] Mission Control is not allowed to run. Possibly a story mission or flashpoint contract.");
+        EncounterRules = null;
+        EncounterRulesName = null;
+        IsMCLoadingFinished = true;
       }
-
-      IsContractValid = true;
-      return true;
     }
 
     private void SetEncounterRule(Type encounterRules) {
@@ -218,8 +307,10 @@ namespace MissionControl {
         EncounterRules.Build();
         EncounterRules.ActivatePostFeatures();
       } else {
+        Main.Logger.Log($"[MissionControl] Mission Control is not allowed to run. Possibly a story mission or flashpoint contract.");
         EncounterRules = null;
         EncounterRulesName = null;
+        IsMCLoadingFinished = true;
       }
     }
 
@@ -261,45 +352,98 @@ namespace MissionControl {
     }
 
     public bool AreAdditionalLancesAllowed(string teamType) {
+      // Allow contract settings overrides to force their respective setting
+      bool areLancesAllowed = Main.Settings.ActiveContractSettings.Has(ContractSettingsOverrides.AdditionalLances_Enable) && Main.Settings.ActiveContractSettings.GetBool(ContractSettingsOverrides.AdditionalLances_Enable);
+      if (areLancesAllowed) return true;
+
       if (Main.Settings.AdditionalLanceSettings.Enable) {
-        bool areLancesAllowed = !(this.CurrentContract.IsFlashpointContract && Main.Settings.AdditionalLanceSettings.DisableIfFlashpointContract);
-        if (areLancesAllowed) areLancesAllowed = Main.Settings.ExtendedLances.GetValidContractTypes().Contains(CurrentContractType);
+        areLancesAllowed = !Main.Settings.AdditionalLanceSettings.IsTeamDisabled(teamType);
+        if (areLancesAllowed) areLancesAllowed = !IsAnyFlashpointContract() || (IsAnyFlashpointContract() && Main.Settings.EnableFlashpointOverrides && Main.Settings.AdditionalLanceSettings.EnableForFlashpoints);
+        if (areLancesAllowed) areLancesAllowed = Main.Settings.AdditionalLanceSettings.GetValidContractTypes().Contains(CurrentContractType);
         if (areLancesAllowed) areLancesAllowed = Main.Settings.AdditionalLanceSettings.DisableWhenMaxTonnage.AreLancesAllowed((int)this.CurrentContract.Override.lanceMaxTonnage);
         if (areLancesAllowed) areLancesAllowed = Main.Settings.ActiveAdditionalLances.GetValidContractTypes(teamType).Contains(CurrentContractType);
 
-        Main.LogDebug($"[AreAdditionalLancesAllowed] {areLancesAllowed}");
+        Main.LogDebug($"[AreAdditionalLancesAllowed] for {teamType}: {areLancesAllowed}");
         return areLancesAllowed;
       }
+
       Main.Logger.Log($"[MissionControl] AdditionalLances are disabled.");
       return false;
     }
 
     public bool IsExtendedBoundariesAllowed() {
+      // Allow contract settings overrides to force their respective setting
+      bool isExtendedBoundariesAllowed = Main.Settings.ActiveContractSettings.Has(ContractSettingsOverrides.ExtendedBoundaries_Enable) && Main.Settings.ActiveContractSettings.GetBool(ContractSettingsOverrides.ExtendedBoundaries_Enable);
+      if (isExtendedBoundariesAllowed) return true;
+
       if (Main.Settings.ExtendedBoundaries.Enable) {
-        bool isExtendedBoundariesAllowed = Main.Settings.ExtendedBoundaries.GetValidContractTypes().Contains(CurrentContractType);
+        isExtendedBoundariesAllowed = !IsAnyFlashpointContract() || (IsAnyFlashpointContract() && Main.Settings.EnableFlashpointOverrides && Main.Settings.ExtendedBoundaries.EnableForFlashpoints);
+        if (isExtendedBoundariesAllowed) isExtendedBoundariesAllowed = Main.Settings.ExtendedBoundaries.GetValidContractTypes().Contains(CurrentContractType);
         return isExtendedBoundariesAllowed;
       }
       return false;
     }
 
     public bool IsExtendedLancesAllowed() {
+      // Allow contract settings overrides to force their respective setting
+      bool isExtendedLancesAllowed = Main.Settings.ActiveContractSettings.Has(ContractSettingsOverrides.ExtendedLances_Enable) && Main.Settings.ActiveContractSettings.GetBool(ContractSettingsOverrides.ExtendedLances_Enable);
+      if (isExtendedLancesAllowed) return true;
+
       if (Main.Settings.ExtendedLances.Enable) {
-        bool isExtendedLancesAllowed = Main.Settings.ExtendedLances.GetValidContractTypes().Contains(CurrentContractType);
+        isExtendedLancesAllowed = !IsAnyFlashpointContract() || (IsAnyFlashpointContract() && Main.Settings.EnableFlashpointOverrides && Main.Settings.ExtendedLances.EnableForFlashpoints);
+        if (isExtendedLancesAllowed) isExtendedLancesAllowed = Main.Settings.ExtendedLances.GetValidContractTypes().Contains(CurrentContractType);
         return isExtendedLancesAllowed;
       }
       return false;
     }
 
     public bool IsRandomSpawnsAllowed() {
+      // Allow contract settings overrides to force their respective setting
+      bool isRandomSpawnsAllowed = Main.Settings.ActiveContractSettings.Has(ContractSettingsOverrides.RandomSpawns_Enable) && Main.Settings.ActiveContractSettings.GetBool(ContractSettingsOverrides.RandomSpawns_Enable);
+      if (isRandomSpawnsAllowed) return true;
+
       if (Main.Settings.RandomSpawns.Enable) {
-        bool isRandomSpawnsAllowed = Main.Settings.RandomSpawns.GetValidContractTypes().Contains(CurrentContractType);
+        isRandomSpawnsAllowed = !IsAnyFlashpointContract() || (IsAnyFlashpointContract() && Main.Settings.EnableFlashpointOverrides && Main.Settings.RandomSpawns.EnableForFlashpoints);
+        if (isRandomSpawnsAllowed) isRandomSpawnsAllowed = Main.Settings.RandomSpawns.GetValidContractTypes().Contains(CurrentContractType);
         return isRandomSpawnsAllowed;
       }
       return false;
     }
 
+    public bool IsDynamicWithdrawAllowed() {
+      // Allow contract settings overrides to force their respective setting
+      bool isDynamicWithdrawAllowed = Main.Settings.ActiveContractSettings.Has(ContractSettingsOverrides.DynamicWithdraw_Enable) && Main.Settings.ActiveContractSettings.GetBool(ContractSettingsOverrides.DynamicWithdraw_Enable);
+      if (isDynamicWithdrawAllowed) return true;
+
+      if (Main.Settings.DynamicWithdraw.Enable) {
+        isDynamicWithdrawAllowed = !IsAnyFlashpointContract() || (IsAnyFlashpointContract() && Main.Settings.EnableFlashpointOverrides && Main.Settings.DynamicWithdraw.EnableForFlashpoints);
+        if (isDynamicWithdrawAllowed) isDynamicWithdrawAllowed = !MissionControl.Instance.IsSkirmish();
+        return isDynamicWithdrawAllowed;
+      }
+      return false;
+    }
+
     public bool IsSkirmish(Contract contract) {
-      return !contract.ContractTypeValue.IsSinglePlayerProcedural;
+      return !contract.ContractTypeValue.IsSinglePlayerProcedural && contract.ContractTypeValue.IsSkirmish;
+    }
+
+    public bool IsHotDropProtectionAllowed() {
+      // Allow contract settings overrides to force their respective setting
+      bool isHotDropProtectionAllowed = Main.Settings.ActiveContractSettings.Has(ContractSettingsOverrides.HotDropProtection_Enable) && Main.Settings.ActiveContractSettings.GetBool(ContractSettingsOverrides.HotDropProtection_Enable);
+      if (isHotDropProtectionAllowed) return true;
+
+      return Main.Settings.HotDropProtection.Enable;
+    }
+
+    public bool AreAdditionalPlayerMechsAllowed() {
+      // Allow contract settings overrides to force their respective setting
+      bool areAdditionalPlayerMechsAllowed = Main.Settings.ActiveContractSettings.Has(ContractSettingsOverrides.AdditionalPlayerMechs_Enable) && Main.Settings.ActiveContractSettings.GetBool(ContractSettingsOverrides.AdditionalPlayerMechs_Enable);
+      if (areAdditionalPlayerMechsAllowed) return true;
+
+      areAdditionalPlayerMechsAllowed = !IsAnyFlashpointContract() || (IsAnyFlashpointContract() && Main.Settings.EnableAdditionalPlayerMechsForFlashpoints);
+      if (areAdditionalPlayerMechsAllowed) areAdditionalPlayerMechsAllowed = Main.Settings.AdditionalPlayerMechs;
+
+      return areAdditionalPlayerMechsAllowed;
     }
 
     public bool IsSkirmish() {
@@ -307,6 +451,10 @@ namespace MissionControl {
         return IsSkirmish(CurrentContract);
       }
       return false;
+    }
+
+    public bool IsAnyFlashpointContract() {
+      return this.CurrentContract.IsFlashpointContract || this.CurrentContract.IsFlashpointCampaignContract;
     }
 
     public bool ShouldUseElites(FactionDef faction, string teamType) {
@@ -324,9 +472,20 @@ namespace MissionControl {
       return null;
     }
 
-    public bool AllowMissionControl() {
-      if (!this.CurrentContract.IsFlashpointContract) return true;
-      return this.CurrentContract.IsFlashpointContract && !Main.Settings.AdditionalLanceSettings.DisableIfFlashpointContract;
+    public bool AllowMissionControl(bool SkipFromSaveCheck = false) {
+      if (CurrentContract == null) return false;
+
+      if (!SkipFromSaveCheck) {
+        if (IsLoadingFromSave) return false;
+      }
+
+      if (CurrentContract.IsStoryContract) return false;
+      if (CurrentContract.IsRestorationContract) return false;
+      if (!IsAnyFlashpointContract()) return true;
+      if (IsAnyFlashpointContract() && Main.Settings.ActiveContractSettings.Enabled) return true;
+      if (IsAnyFlashpointContract() && !Main.Settings.EnableFlashpointOverrides) return false;
+
+      return false;
     }
 
     public bool IsDroppingCustomControlledPlayerLance() {

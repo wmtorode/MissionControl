@@ -5,7 +5,7 @@ using Newtonsoft.Json;
 
 namespace MissionControl.Config {
   public class ExtendedBoundariesSettings : AdvancedSettings {
-    [JsonProperty("SizePercentage")]
+    [JsonProperty("IncreaseBoundarySizeByPercentage")]
     public float IncreaseBoundarySizeByPercentage { get; set; } = 0.2f;
 
     [JsonProperty("Overrides")]
@@ -15,6 +15,8 @@ namespace MissionControl.Config {
       string id = $"{mapId}.{contractTypeName}";
 
       foreach (ExtendedBoundariesOverride ovr in Overrides) {
+        if (ovr.MapId == "UNSET") ovr.MapId = mapId;  // Allow for fuzzy map matching
+
         if (ovr.Id == id) return ovr.IncreaseBoundarySizeByPercentage;
       }
 
